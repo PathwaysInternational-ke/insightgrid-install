@@ -3,12 +3,12 @@
 Installs or upgrades InsightGrid on a client-managed Linux server with one command:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/PathwaysInternational-ke/insightgrid-install/main/get.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/PathwaysInternational-ke/insightgrid-install/main/get.sh | bash
 ```
 
 ## What you need
 
-- An Ubuntu or Debian server (x86_64), with sudo through a named administrator account.
+- An Ubuntu or Debian server (x86_64) and a named administrator account with sudo. Run the command as that account, without sudo: the script asks for sudo itself, so Ctrl+C keeps working (it asks before stopping).
 - A registry username and read-only access token from Pathways.
 - Outbound HTTPS to `ghcr.io`, Docker Hub and `download.docker.com` (or ask Pathways for the offline bundle).
 
