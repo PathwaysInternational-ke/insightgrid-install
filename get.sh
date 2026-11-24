@@ -14,8 +14,10 @@ TAG=${IG_VERSION:-latest}
 RELEASES=${IG_RELEASES:-/opt/insightgrid-releases}
 export IG_HOME=${IG_HOME:-/opt/insightgrid}
 
-bold=$'\033[1m' red=$'\033[1;31m' off=$'\033[0m'; [ -t 1 ] || bold="" red="" off=""
+bold=$'\033[1m' red=$'\033[1;31m' orange=$'\033[1;38;5;208m' green=$'\033[1;32m' off=$'\033[0m'
+[ -t 1 ] || bold="" red="" orange="" green="" off=""
 say() { printf '%s==>%s %s\n' "$bold" "$off" "$*"; }
+warn() { printf '%s==> %s%s\n' "$orange" "$*" "$off"; }
 die() { printf '%sError:%s %s\n' "$red" "$off" "$*" >&2; exit 1; }
 # stdin is this script (curl | bash), so questions read the terminal.
 ask() { local reply; read -r ${3:+-s} -p "$2" reply </dev/tty || true; [ -z "${3:-}" ] || echo; printf -v "$1" '%s' "$reply"; }
@@ -23,7 +25,7 @@ ask() { local reply; read -r ${3:+-s} -p "$2" reply </dev/tty || true; [ -z "${3
 [ "$(uname -s)" = Linux ] || die "InsightGrid installs on Linux servers."
 case "$(uname -m)" in x86_64|amd64) ;; *) die "InsightGrid images are built for x86_64; this server is $(uname -m)." ;; esac
 os_id=$(. /etc/os-release 2>/dev/null && echo "${ID:-}"); os_name=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")
-case "$os_id" in ubuntu|debian) ;; *) say "Untested system ($os_name); Ubuntu or Debian is recommended." ;; esac
+case "$os_id" in ubuntu|debian) ;; *) warn "Untested system ($os_name); Ubuntu or Debian is recommended." ;; esac
 [ -r /dev/tty ] || [ -n "${IG_TOKEN:-}" ] || die "Run this from an interactive terminal, or set IG_REGISTRY_USER and IG_TOKEN."
 
 ALLOW_ROOT=()
@@ -31,7 +33,7 @@ if [ "$(id -u)" -ne 0 ]; then
   docker info >/dev/null 2>&1 && mkdir -p "$RELEASES" 2>/dev/null && [ -w "$RELEASES" ] \
     || die "Run it with sudo:  curl -fsSL https://raw.githubusercontent.com/PathwaysInternational-ke/insightgrid-install/main/get.sh | sudo bash"
 elif [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = root ]; then
-  cat <<'MSG'
+  printf '%s' "$orange"; cat <<'MSG'
 You are signed in as root. We recommend a named administrator account instead, so every action
 is traceable and root login can be switched off:
 
@@ -39,6 +41,7 @@ is traceable and root login can be switched off:
   sign in as itadmin and run the same command with sudo
 
 MSG
+  printf '%s' "$off"
   ask answer "Type ROOT to continue as root anyway, or press Enter to stop: "
   [ "$answer" = ROOT ] || die "Stopped. Nothing was changed."
   ALLOW_ROOT=(--allow-root)
@@ -88,5 +91,5 @@ say "Analysing this server"
 say "Installing InsightGrid $release"
 ./install.sh "${ALLOW_ROOT[@]}"
 if grep -q '^IG_TLS=internal' "$IG_HOME/site.env" 2>/dev/null; then
-  say "Private site: install $IG_HOME/extra-ca.crt as a trusted root certificate on each computer that opens InsightGrid."
+  warn "Private site: install $IG_HOME/extra-ca.crt as a trusted root certificate on each computer that opens InsightGrid."
 fi
