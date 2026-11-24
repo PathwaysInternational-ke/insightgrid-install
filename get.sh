@@ -6,11 +6,11 @@
 # It checks the server, installs Docker if missing, signs in to Pathways' private registry with
 # the access token you were given, downloads the release bundle, analyses the server, asks the
 # site questions once, and installs. Running it again upgrades to the latest release.
-# Environment: IG_VERSION (default latest), IG_REGISTRY_USER, IG_TOKEN, IG_HOME, IG_RELEASES.
+# Environment: IG_VERSION (default stable), IG_REGISTRY_USER, IG_TOKEN, IG_HOME, IG_RELEASES.
 set -Eeuo pipefail
 REGISTRY=ghcr.io
-BUNDLE_IMAGE=${IG_BUNDLE_IMAGE:-$REGISTRY/pathwaysinternational-ke/insightgrid-client-bundle}
-TAG=${IG_VERSION:-latest}
+BUNDLE_IMAGE=${IG_BUNDLE_IMAGE:-$REGISTRY/pathwaysinternational-ke/insightgrid-client-release}
+TAG=${IG_VERSION:-stable}
 RELEASES=${IG_RELEASES:-/opt/insightgrid-releases}
 GET_URL=${IG_GET_URL:-https://raw.githubusercontent.com/PathwaysInternational-ke/insightgrid-install/main/get.sh}
 export IG_HOME=${IG_HOME:-/opt/insightgrid}
@@ -64,7 +64,11 @@ ALLOW_ROOT=()
 if [ "$(id -u)" -ne 0 ]; then
   # Without root: rerun this script under sudo with the keyboard as input, so prompts and Ctrl+C
   # behave normally (piping into sudo leaves sudo unable to pass Ctrl+C on).
-  if ! { docker info >/dev/null 2>&1 && mkdir -p "$RELEASES" 2>/dev/null && [ -w "$RELEASES" ]; }; then
+  # Without root, continue only with Docker access and full access to the releases and site folders
+  # (a root-owned site folder would hide an unfinished upgrade's markers).
+  if ! { docker info >/dev/null 2>&1 && mkdir -p "$RELEASES" 2>/dev/null && [ -w "$RELEASES" ] \
+         && { { [ -d "$IG_HOME" ] && [ -r "$IG_HOME" ] && [ -w "$IG_HOME" ] && [ -x "$IG_HOME" ]; } \
+              || { [ ! -e "$IG_HOME" ] && [ -w "$(dirname "$IG_HOME")" ] && [ -x "$(dirname "$IG_HOME")" ]; }; }; }; then
     [ -z "${IG_REEXEC:-}" ] || die "sudo did not give administrator rights; ask your server administrator."
     self="${BASH_SOURCE[0]:-}"
     if [ ! -f "$self" ]; then
@@ -106,7 +110,24 @@ if ! command -v docker >/dev/null; then
 fi
 docker compose version >/dev/null 2>&1 || die "Docker is installed but the Compose plugin is missing: install docker-compose-plugin."
 
-if [ "${IG_NO_PULL:-0}" != 1 ]; then
+# Same fingerprint as install.sh's bundle_hash.
+# Fails on a symlink (its target could change without changing the hash) or an unreadable file.
+bundle_hash() {
+  local links; links=$(find "$1" -type l -print -quit) && [ -z "$links" ] || return 1
+  (set -o pipefail; cd "$1" && find . -type f ! -name .bundle-digest -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64)
+}
+# An upgrade that stopped halfway is finished with the release it started, not a newer latest.
+resume=""
+if [ -f "$IG_HOME/.upgrade-target" ]; then
+  read -r thash resume <"$IG_HOME/.upgrade-target" || true
+  [ -x "$resume/install.sh" ] || die "An upgrade is unfinished but its release folder $resume is missing. Ask Pathways before continuing."
+  { h=$(bundle_hash "$resume") && [ "$h" = "$thash" ]; } || die "The release folder $resume changed after its upgrade began. Ask Pathways before continuing."
+  say "Resuming the unfinished upgrade with $(basename "$resume")"
+elif [ -f "$IG_HOME/.upgrade-backup" ]; then
+  die "An upgrade started by an earlier installer is unfinished. Finish it by running ./install.sh in the release folder you used."
+fi
+
+if [ -z "$resume" ] && [ "${IG_NO_PULL:-0}" != 1 ]; then
   if ! run_bg /dev/null docker pull -q "$BUNDLE_IMAGE:$TAG"; then
     say "Sign in to Pathways' image registry (read-only access you were given)"
     user=${IG_REGISTRY_USER:-}; token=${IG_TOKEN:-}
@@ -121,21 +142,35 @@ if [ "${IG_NO_PULL:-0}" != 1 ]; then
 fi
 
 # Unpack next to the releases, then rename into place: an interrupted copy never leaves a half release.
+if [ -n "$resume" ]; then
+  dest=$resume; release=$(basename "$resume")
+else
 # Named before it exists, so cleanup on exit can always find the temporary container.
 cname="insightgrid-bundle-$$-$RANDOM"; stage=$(mktemp -d "$RELEASES/.incoming.XXXXXX")
 trap 'rm -rf "$stage"; docker rm -f "$cname" >/dev/null 2>&1 || true' EXIT
-run_bg /dev/null docker create --name "$cname" "$BUNDLE_IMAGE:$TAG" /none || die "Cannot open the release bundle."
+# Resolved once: the bundle unpacked is the one recorded in .bundle-digest, even if the tag moves meanwhile.
+# A loaded image (IG_NO_PULL) may carry no registry digest; it is then opened by tag and not recorded.
+ref=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$BUNDLE_IMAGE:$TAG" 2>/dev/null | grep -m1 "^$BUNDLE_IMAGE@sha256:") || ref=""
+[ -n "$ref" ] || [ "${IG_NO_PULL:-0}" = 1 ] || die "Cannot resolve the downloaded bundle's digest."
+run_bg /dev/null docker create --name "$cname" "${ref:-$BUNDLE_IMAGE:$TAG}" /none || die "Cannot open the release bundle."
 run_bg /dev/null docker cp "$cname:/bundle/." "$stage/" || die "Cannot unpack the release bundle."
 docker rm "$cname" >/dev/null 2>&1 || true
 release=$(grep -m1 '^IG_VERSION=' "$stage/release.env" | cut -d= -f2-)
 [[ "$release" =~ ^[A-Za-z0-9._-]+$ ]] && [ -x "$stage/install.sh" ] || die "The downloaded bundle is incomplete."
+# An older installer would not refuse a downgrade itself, so an undated release never replaces a dated one.
+if grep -q '^IG_RELEASED_AT=.' "$IG_HOME/installed-release.env" 2>/dev/null && ! grep -q '^IG_RELEASED_AT=.' "$stage/release.env"; then
+  die "Release $release carries no release date but this site's installed release does; it may be older. Ask Pathways for a current release."
+fi
 dest="$RELEASES/$release"
 if [ -d "$dest" ]; then
-  diff -rq -x .bundle-digest "$stage" "$dest" >/dev/null 2>&1 || die "$dest exists with different contents; move it aside and rerun."
+  modes() { (set -o pipefail; cd "$1" && find . -mindepth 1 ! -name .bundle-digest -printf '%m %p\n' | LC_ALL=C sort); }
+  { diff -rq -x .bundle-digest "$stage" "$dest" >/dev/null 2>&1 && m1=$(modes "$stage") && m2=$(modes "$dest") && [ "$m1" = "$m2" ]; } \
+    || die "$dest exists with different contents; move it aside and rerun."
 else
   chmod 755 "$stage"; mv "$stage" "$dest"
 fi
-docker image inspect -f '{{index .RepoDigests 0}}' "$BUNDLE_IMAGE:$TAG" >"$dest/.bundle-digest" 2>/dev/null || true
+if [ -n "$ref" ]; then echo "$ref" >"$dest/.bundle-digest"; else rm -f "$dest/.bundle-digest"; fi
+fi
 say "Release $release in $dest"
 
 cd "$dest"
